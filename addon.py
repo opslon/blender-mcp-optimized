@@ -1,6 +1,7 @@
 # Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
 
 import re
+import struct
 import bpy
 import mathutils
 import json
@@ -123,54 +124,66 @@ class BlenderMCPServer:
 
         print("Server thread stopped")
 
+    @staticmethod
+    def _recv_exactly(sock, n):
+        """Receive exactly n bytes from a socket."""
+        data = b''
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("Connection closed while receiving data")
+            data += chunk
+        return data
+
+    @staticmethod
+    def _send_with_header(sock, payload_bytes):
+        """Send a message with a 4-byte big-endian length header."""
+        header = struct.pack('!I', len(payload_bytes))
+        sock.sendall(header + payload_bytes)
+
     def _handle_client(self, client):
-        """Handle connected client"""
+        """Handle connected client using length-prefixed messages"""
         print("Client handler started")
         client.settimeout(None)  # No timeout
-        buffer = b''
 
         try:
             while self.running:
-                # Receive data
                 try:
-                    data = client.recv(8192)
-                    if not data:
-                        print("Client disconnected")
-                        break
+                    # Read 4-byte length header
+                    header = self._recv_exactly(client, 4)
+                    msg_len = struct.unpack('!I', header)[0]
 
-                    buffer += data
-                    try:
-                        # Try to parse command
-                        command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
+                    # Read the full message
+                    raw = self._recv_exactly(client, msg_len)
+                    command = json.loads(raw.decode('utf-8'))
 
-                        # Execute command in Blender's main thread
-                        def execute_wrapper():
+                    # Execute command in Blender's main thread
+                    def execute_wrapper():
+                        try:
+                            response = self.execute_command(command)
+                            response_bytes = json.dumps(response).encode('utf-8')
                             try:
-                                response = self.execute_command(command)
-                                response_json = json.dumps(response)
-                                try:
-                                    client.sendall(response_json.encode('utf-8'))
-                                except:
-                                    print("Failed to send response - client disconnected")
-                            except Exception as e:
-                                print(f"Error executing command: {str(e)}")
-                                traceback.print_exc()
-                                try:
-                                    error_response = {
-                                        "status": "error",
-                                        "message": str(e)
-                                    }
-                                    client.sendall(json.dumps(error_response).encode('utf-8'))
-                                except:
-                                    pass
-                            return None
+                                self._send_with_header(client, response_bytes)
+                            except:
+                                print("Failed to send response - client disconnected")
+                        except Exception as e:
+                            print(f"Error executing command: {str(e)}")
+                            traceback.print_exc()
+                            try:
+                                error_response = {
+                                    "status": "error",
+                                    "message": str(e)
+                                }
+                                self._send_with_header(client, json.dumps(error_response).encode('utf-8'))
+                            except:
+                                pass
+                        return None
 
-                        # Schedule execution in main thread
-                        bpy.app.timers.register(execute_wrapper, first_interval=0.0)
-                    except json.JSONDecodeError:
-                        # Incomplete data, wait for more
-                        pass
+                    # Schedule execution in main thread
+                    bpy.app.timers.register(execute_wrapper, first_interval=0.0)
+                except ConnectionError:
+                    print("Client disconnected")
+                    break
                 except Exception as e:
                     print(f"Error receiving data: {str(e)}")
                     break
@@ -193,16 +206,8 @@ class BlenderMCPServer:
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
 
-    def _execute_command_internal(self, command):
-        """Internal command execution with proper context"""
-        cmd_type = command.get("type")
-        params = command.get("params", {})
-
-        # Add a handler for checking PolyHaven status
-        if cmd_type == "get_polyhaven_status":
-            return {"status": "success", "result": self.get_polyhaven_status()}
-
-        # Base handlers that are always available
+    def _build_handlers(self):
+        """Build the handler map based on current integration toggles."""
         handlers = {
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
@@ -215,44 +220,59 @@ class BlenderMCPServer:
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
         }
 
-        # Add Polyhaven handlers only if enabled
         if bpy.context.scene.blendermcp_use_polyhaven:
-            polyhaven_handlers = {
+            handlers.update({
                 "get_polyhaven_categories": self.get_polyhaven_categories,
                 "search_polyhaven_assets": self.search_polyhaven_assets,
                 "download_polyhaven_asset": self.download_polyhaven_asset,
                 "set_texture": self.set_texture,
-            }
-            handlers.update(polyhaven_handlers)
+            })
 
-        # Add Hyper3d handlers only if enabled
         if bpy.context.scene.blendermcp_use_hyper3d:
-            polyhaven_handlers = {
+            handlers.update({
                 "create_rodin_job": self.create_rodin_job,
                 "poll_rodin_job_status": self.poll_rodin_job_status,
                 "import_generated_asset": self.import_generated_asset,
-            }
-            handlers.update(polyhaven_handlers)
+            })
 
-        # Add Sketchfab handlers only if enabled
         if bpy.context.scene.blendermcp_use_sketchfab:
-            sketchfab_handlers = {
+            handlers.update({
                 "search_sketchfab_models": self.search_sketchfab_models,
                 "get_sketchfab_model_preview": self.get_sketchfab_model_preview,
                 "download_sketchfab_model": self.download_sketchfab_model,
-            }
-            handlers.update(sketchfab_handlers)
-        
-        # Add Hunyuan3d handlers only if enabled
+            })
+
         if bpy.context.scene.blendermcp_use_hunyuan3d:
-            hunyuan_handlers = {
+            handlers.update({
                 "create_hunyuan_job": self.create_hunyuan_job,
                 "poll_hunyuan_job_status": self.poll_hunyuan_job_status,
-                "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan
-            }
-            handlers.update(hunyuan_handlers)
+                "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan,
+            })
 
-        handler = handlers.get(cmd_type)
+        return handlers
+
+    def _get_toggle_state(self):
+        """Return current integration toggle state as a tuple for comparison."""
+        scene = bpy.context.scene
+        return (
+            scene.blendermcp_use_polyhaven,
+            scene.blendermcp_use_hyper3d,
+            scene.blendermcp_use_sketchfab,
+            scene.blendermcp_use_hunyuan3d,
+        )
+
+    def _execute_command_internal(self, command):
+        """Internal command execution with proper context"""
+        cmd_type = command.get("type")
+        params = command.get("params", {})
+
+        # Rebuild handler map only when integration toggles change
+        current_toggles = self._get_toggle_state()
+        if not hasattr(self, '_cached_handlers') or self._cached_toggles != current_toggles:
+            self._cached_handlers = self._build_handlers()
+            self._cached_toggles = current_toggles
+
+        handler = self._cached_handlers.get(cmd_type)
         if handler:
             try:
                 print(f"Executing handler for {cmd_type}")
@@ -363,19 +383,16 @@ class BlenderMCPServer:
 
     def get_viewport_screenshot(self, max_size=800, filepath=None, format="png"):
         """
-        Capture a screenshot of the current 3D viewport and save it to the specified path.
+        Capture a screenshot of the current 3D viewport and return it as base64.
 
         Parameters:
         - max_size: Maximum size in pixels for the largest dimension of the image
-        - filepath: Path where to save the screenshot file
+        - filepath: Optional path (used as temp location for capture)
         - format: Image format (png, jpg, etc.)
 
-        Returns success/error status
+        Returns success with base64-encoded image data.
         """
         try:
-            if not filepath:
-                return {"error": "No filepath provided"}
-
             # Find the active 3D viewport
             area = None
             for a in bpy.context.screen.areas:
@@ -386,12 +403,15 @@ class BlenderMCPServer:
             if not area:
                 return {"error": "No 3D viewport found"}
 
+            # Use a temp file for the screenshot capture (Blender requires a file path)
+            tmp_path = filepath or os.path.join(tempfile.gettempdir(), f"blender_mcp_screenshot.png")
+
             # Take screenshot with proper context override
             with bpy.context.temp_override(area=area):
-                bpy.ops.screen.screenshot_area(filepath=filepath)
+                bpy.ops.screen.screenshot_area(filepath=tmp_path)
 
             # Load and resize if needed
-            img = bpy.data.images.load(filepath)
+            img = bpy.data.images.load(tmp_path)
             width, height = img.size
 
             if max(width, height) > max_size:
@@ -400,19 +420,30 @@ class BlenderMCPServer:
                 new_height = int(height * scale)
                 img.scale(new_width, new_height)
 
-                # Set format and save
+                # Save resized image back to temp path
                 img.file_format = format.upper()
-                img.save()
+                img.save_render(tmp_path)
                 width, height = new_width, new_height
 
             # Cleanup Blender image data
             bpy.data.images.remove(img)
 
+            # Read file and encode as base64
+            with open(tmp_path, 'rb') as f:
+                image_b64 = base64.b64encode(f.read()).decode('ascii')
+
+            # Clean up temp file
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+
             return {
                 "success": True,
                 "width": width,
                 "height": height,
-                "filepath": filepath
+                "image_data": image_b64,
+                "format": format
             }
 
         except Exception as e:

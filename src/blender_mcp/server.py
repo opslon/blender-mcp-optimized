@@ -1,10 +1,10 @@
 # blender_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
+import struct
 import json
 import asyncio
 import logging
-import tempfile
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
@@ -29,20 +29,26 @@ class BlenderConnection:
     port: int
     sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
     
-    def connect(self) -> bool:
-        """Connect to the Blender addon socket server"""
+    def connect(self, retries: int = 3, backoff: float = 0.5) -> bool:
+        """Connect to the Blender addon socket server with retry and backoff"""
         if self.sock:
             return True
-            
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            logger.info(f"Connected to Blender at {self.host}:{self.port}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to Blender: {str(e)}")
-            self.sock = None
-            return False
+
+        import time
+        for attempt in range(retries):
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.connect((self.host, self.port))
+                logger.info(f"Connected to Blender at {self.host}:{self.port}")
+                return True
+            except Exception as e:
+                logger.warning(f"Connection attempt {attempt + 1}/{retries} failed: {e}")
+                self.sock = None
+                if attempt < retries - 1:
+                    time.sleep(backoff * (2 ** attempt))
+
+        logger.error(f"Failed to connect to Blender after {retries} attempts")
+        return False
     
     def disconnect(self):
         """Disconnect from the Blender addon"""
@@ -54,99 +60,51 @@ class BlenderConnection:
             finally:
                 self.sock = None
 
-    def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
-        chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
-        
-        try:
-            while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        # If we get an empty chunk, the connection might be closed
-                        if not chunks:  # If we haven't received anything yet, this is an error
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        # If we get here, it parsed successfully
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
-                        continue
-                except socket.timeout:
-                    # If we hit a timeout during receiving, break the loop and try to use what we have
-                    logger.warning("Socket timeout during chunked receive")
-                    break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise  # Re-raise to be handled by the caller
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        # Try to use what we have
-        if chunks:
-            data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
-            try:
-                # Try to parse what we have
-                json.loads(data.decode('utf-8'))
-                return data
-            except json.JSONDecodeError:
-                # If we can't parse it, it's incomplete
-                raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
+    @staticmethod
+    def _recv_exactly(sock, n):
+        """Receive exactly n bytes from a socket."""
+        data = b''
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("Connection closed while receiving data")
+            data += chunk
+        return data
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Blender and return the response"""
+        """Send a length-prefixed command to Blender and return the response"""
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Blender")
-        
+
         command = {
             "type": command_type,
             "params": params or {}
         }
-        
+
         try:
-            # Log the command being sent
-            logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
-            
-            # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
-            response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
+            logger.info(f"Sending command: {command_type}")
+
+            # Send with 4-byte big-endian length header
+            payload = json.dumps(command).encode('utf-8')
+            header = struct.pack('!I', len(payload))
+            self.sock.sendall(header + payload)
+
+            # Receive response: 4-byte header + payload
+            self.sock.settimeout(180.0)
+            resp_header = self._recv_exactly(self.sock, 4)
+            resp_len = struct.unpack('!I', resp_header)[0]
+            resp_data = self._recv_exactly(self.sock, resp_len)
+
+            response = json.loads(resp_data.decode('utf-8'))
+            logger.info(f"Response received ({resp_len} bytes), status: {response.get('status', 'unknown')}")
+
             if response.get("status") == "error":
                 logger.error(f"Blender error: {response.get('message')}")
                 raise Exception(response.get("message", "Unknown error from Blender"))
-            
+
             return response.get("result", {})
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
             self.sock = None
             raise Exception("Timeout waiting for Blender response - try simplifying your request")
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
@@ -155,13 +113,9 @@ class BlenderConnection:
             raise Exception(f"Connection to Blender lost: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
             raise Exception(f"Invalid response from Blender: {str(e)}")
         except Exception as e:
             logger.error(f"Error communicating with Blender: {str(e)}")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
             self.sock = None
             raise Exception(f"Communication error with Blender: {str(e)}")
 
@@ -275,32 +229,21 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
     """
     try:
         blender = get_blender_connection()
-        
-        # Create temp file path
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"blender_screenshot_{os.getpid()}.png")
-        
+
         result = blender.send_command("get_viewport_screenshot", {
             "max_size": max_size,
-            "filepath": temp_path,
             "format": "png"
         })
-        
+
         if "error" in result:
             raise Exception(result["error"])
-        
-        if not os.path.exists(temp_path):
-            raise Exception("Screenshot file was not created")
-        
-        # Read the file
-        with open(temp_path, 'rb') as f:
-            image_bytes = f.read()
-        
-        # Delete the temp file
-        os.remove(temp_path)
-        
-        return Image(data=image_bytes, format="png")
-        
+
+        # Decode base64 image data received from addon
+        image_bytes = base64.b64decode(result["image_data"])
+        img_format = result.get("format", "png")
+
+        return Image(data=image_bytes, format=img_format)
+
     except Exception as e:
         logger.error(f"Error capturing screenshot: {str(e)}")
         raise Exception(f"Screenshot failed: {str(e)}")
