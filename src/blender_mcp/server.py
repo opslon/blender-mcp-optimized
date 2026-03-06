@@ -13,9 +13,6 @@ from pathlib import Path
 import base64
 from urllib.parse import urlparse
 
-# Import telemetry
-from .telemetry import record_startup, get_telemetry
-from .telemetry_decorator import telemetry_tool
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -178,12 +175,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Just log that we're starting up
         logger.info("BlenderMCP server starting up")
 
-        # Record startup event for telemetry
-        try:
-            record_startup()
-        except Exception as e:
-            logger.debug(f"Failed to record startup telemetry: {e}")
-
         # Try to connect to Blender on startup to verify it's available
         try:
             # This will initialize the global connection if needed
@@ -214,29 +205,19 @@ mcp = FastMCP(
 
 # Global connection for resources (since resources can't access context)
 _blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
 
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
-    # If we have an existing connection, check if it's still valid
+    global _blender_connection
+
+    # If we have an existing connection, verify the socket is still open
     if _blender_connection is not None:
-        try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
+        if _blender_connection.sock is not None:
             return _blender_connection
-        except Exception as e:
-            # Connection is dead, close it and create a new one
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _blender_connection.disconnect()
-            except:
-                pass
+        else:
+            # Socket was closed (e.g. after a failed send), discard
             _blender_connection = None
-    
+
     # Create a new connection if needed
     if _blender_connection is None:
         host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
@@ -247,11 +228,10 @@ def get_blender_connection():
             _blender_connection = None
             raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
         logger.info("Created new persistent connection to Blender")
-    
+
     return _blender_connection
 
 
-@telemetry_tool("get_scene_info")
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
     """Get detailed information about the current Blender scene"""
@@ -265,7 +245,6 @@ def get_scene_info(ctx: Context) -> str:
         logger.error(f"Error getting scene info from Blender: {str(e)}")
         return f"Error getting scene info: {str(e)}"
 
-@telemetry_tool("get_object_info")
 @mcp.tool()
 def get_object_info(ctx: Context, object_name: str) -> str:
     """
@@ -284,7 +263,6 @@ def get_object_info(ctx: Context, object_name: str) -> str:
         logger.error(f"Error getting object info from Blender: {str(e)}")
         return f"Error getting object info: {str(e)}"
 
-@telemetry_tool("get_viewport_screenshot")
 @mcp.tool()
 def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
     """
@@ -328,7 +306,6 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
         raise Exception(f"Screenshot failed: {str(e)}")
 
 
-@telemetry_tool("execute_blender_code")
 @mcp.tool()
 def execute_blender_code(ctx: Context, code: str) -> str:
     """
@@ -346,7 +323,6 @@ def execute_blender_code(ctx: Context, code: str) -> str:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
 
-@telemetry_tool("get_polyhaven_categories")
 @mcp.tool()
 def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
     """
@@ -357,7 +333,9 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
     """
     try:
         blender = get_blender_connection()
-        if not _polyhaven_enabled:
+        # Check PolyHaven status directly
+        status = blender.send_command("get_polyhaven_status")
+        if not status.get("enabled", False):
             return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
         result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
         
@@ -379,7 +357,6 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
         logger.error(f"Error getting Polyhaven categories: {str(e)}")
         return f"Error getting Polyhaven categories: {str(e)}"
 
-@telemetry_tool("search_polyhaven_assets")
 @mcp.tool()
 def search_polyhaven_assets(
     ctx: Context,
@@ -429,7 +406,6 @@ def search_polyhaven_assets(
         logger.error(f"Error searching Polyhaven assets: {str(e)}")
         return f"Error searching Polyhaven assets: {str(e)}"
 
-@telemetry_tool("download_polyhaven_asset")
 @mcp.tool()
 def download_polyhaven_asset(
     ctx: Context,
@@ -481,7 +457,6 @@ def download_polyhaven_asset(
         logger.error(f"Error downloading Polyhaven asset: {str(e)}")
         return f"Error downloading Polyhaven asset: {str(e)}"
 
-@telemetry_tool("set_texture")
 @mcp.tool()
 def set_texture(
     ctx: Context,
@@ -541,7 +516,6 @@ def set_texture(
         logger.error(f"Error applying texture: {str(e)}")
         return f"Error applying texture: {str(e)}"
 
-@telemetry_tool("get_polyhaven_status")
 @mcp.tool()
 def get_polyhaven_status(ctx: Context) -> str:
     """
@@ -560,7 +534,6 @@ def get_polyhaven_status(ctx: Context) -> str:
         logger.error(f"Error checking PolyHaven status: {str(e)}")
         return f"Error checking PolyHaven status: {str(e)}"
 
-@telemetry_tool("get_hyper3d_status")
 @mcp.tool()
 def get_hyper3d_status(ctx: Context) -> str:
     """
@@ -581,7 +554,6 @@ def get_hyper3d_status(ctx: Context) -> str:
         logger.error(f"Error checking Hyper3D status: {str(e)}")
         return f"Error checking Hyper3D status: {str(e)}"
 
-@telemetry_tool("get_sketchfab_status")
 @mcp.tool()
 def get_sketchfab_status(ctx: Context) -> str:
     """
@@ -600,7 +572,6 @@ def get_sketchfab_status(ctx: Context) -> str:
         logger.error(f"Error checking Sketchfab status: {str(e)}")
         return f"Error checking Sketchfab status: {str(e)}"
 
-@telemetry_tool("search_sketchfab_models")
 @mcp.tool()
 def search_sketchfab_models(
     ctx: Context,
@@ -677,7 +648,6 @@ def search_sketchfab_models(
         logger.error(traceback.format_exc())
         return f"Error searching Sketchfab models: {str(e)}"
 
-@telemetry_tool("download_sketchfab_model")
 @mcp.tool()
 def get_sketchfab_model_preview(
     ctx: Context,
@@ -802,7 +772,6 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
         raise ValueError("Incorrect number range: bbox must be bigger than zero!")
     return [int(float(i) / max(original_bbox) * 100) for i in original_bbox] if original_bbox else None
 
-@telemetry_tool("generate_hyper3d_model_via_text")
 @mcp.tool()
 def generate_hyper3d_model_via_text(
     ctx: Context,
@@ -839,7 +808,6 @@ def generate_hyper3d_model_via_text(
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
-@telemetry_tool("generate_hyper3d_model_via_images")
 @mcp.tool()
 def generate_hyper3d_model_via_images(
     ctx: Context,
@@ -896,7 +864,6 @@ def generate_hyper3d_model_via_images(
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
-@telemetry_tool("poll_rodin_job_status")
 @mcp.tool()
 def poll_rodin_job_status(
     ctx: Context,
@@ -940,7 +907,6 @@ def poll_rodin_job_status(
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
-@telemetry_tool("import_generated_asset")
 @mcp.tool()
 def import_generated_asset(
     ctx: Context,
